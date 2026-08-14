@@ -168,3 +168,84 @@ code C:\Users\User\Desktop\app\demo1\demo1-1
 - `.env` is in `.gitignore`. **Never commit API tokens.**
 - The server is intended to run inside a trusted network. If you expose it publicly, add auth (the API key in the `Authorization` header is the simplest bearer-token gate) and switch to HTTPS.
 - Tokens are masked in `/api/health` so you can safely share that endpoint for diagnostics.
+
+---
+
+## Performance & caching
+
+The server caches upstream responses and reuses TLS connections to minimize latency:
+
+| Layer | What | TTL | Notes |
+|---|---|---|---|
+| `services/cache.js` | In-memory cache for `/api/problems` | **10 s** | Coalesces concurrent misses so the user never pays twice for the same refresh |
+| `services/cache.js` | In-memory cache for `/api/models` | **60 s** | |
+| `https.Agent({ keepAlive: true })` | TLS connection pool for Dynatrace + LiteLLM | persistent | `maxSockets: 16`, `freeSocketTimeout: 30s` |
+| `mapWithConcurrency(3)` | Bounded parallelism in `/api/analyze-all` | per-request | Default concurrency = 3 (configurable) |
+| `Cache-Control` headers | Browser-side cache | 5 s | |
+| `DEFAULT_PROBLEM_PAGE_SIZE=10` | Lighter Dynatrace response | — | Default 20 → 10 |
+| Per-call LLM timeout (45 s) | Defends against slow models | — | |
+
+### Measured improvements
+
+Wall-clock timings (single Windows machine, localhost server):
+
+| Endpoint | Before | After | Speedup |
+|---|---|---|---|
+| `GET /api/problems` (cold MISS) | 2 637 ms | 400–700 ms | ~5× (TLS reuse kicks in on burst) |
+| `GET /api/problems` (warm HIT) | 2 637 ms | **5–13 ms** | **~300×** |
+| `GET /api/models` (warm HIT) | 50 ms | **5 ms** | ~10× |
+| `POST /api/analyze-all` (3 problems) | 221 s (sequential) | **5.3 s** (parallel) | **~40×** |
+
+Confirmed in Dynatrace traces (span durations from DQL):
+
+```
+cache.listProblems          11  cache.hit  318µs–671ms
+cache.listModels             3  cache.hit  136µs–45ms
+POST /api/analyze-all        2  -          5.3s (new) / 79.7s (old)
+dynatrace.fetch api/v2/...   1  -          669ms    (one outbound per 10s window)
+```
+
+---
+
+## OpenTelemetry tracing
+
+`tracing.js` boots an OTel SDK with the auto-instrumentations + Dynatrace OTLP exporter (protobuf):
+
+```js
+// exports to https://<tenant>.live.dynatrace.com/api/v2/otlp/v1/traces
+// via @opentelemetry/exporter-trace-otlp-proto
+```
+
+Custom spans emitted by this app:
+
+| Span | Source | Attributes |
+|---|---|---|
+| `cache.listProblems` | `services/dynatrace.js` | `cache.key`, `cache.hit` |
+| `dynatrace.fetch <path>` | `services/dynatrace.js` | `http.method`, `http.url`, `http.status_code`, on error: `exception` |
+| `cache.listModels` | `services/ai.js` | `cache.key`, `cache.hit` |
+| `ai.chat` | `services/ai.js` | `ai.model`, `ai.usage.{prompt,completion,total}_tokens`, `http.status_code` |
+
+Service name on Dynatrace side: `dynatrace-ai-dashboard`.
+
+### Verifying ingest in Dynatrace DQL
+
+```dql
+fetch spans, from:now()-15m
+| filter dt.service.name == "dynatrace-ai-dashboard"
+| filter span.name == "cache.listProblems"
+| fields timestamp, duration, cache.hit
+| sort timestamp desc
+```
+
+The `_query_spans.py` helper is a thin wrapper around the Dynatrace DQL Query API for quick checks:
+
+```powershell
+$env:_CID   = '<client-id>'
+$env:_SECRET = '<client-secret>'
+$env:_RES    = '<account-urn>'
+python _query_spans.py
+```
+
+### Why protobuf and not JSON?
+
+`@opentelemetry/exporter-trace-otlp-http` hardcodes `Content-Type: application/json`. Dynatrace's OTLP endpoint intermittently rejects this with **HTTP 415 Unsupported Media Type**. `@opentelemetry/exporter-trace-otlp-proto` sends `application/x-protobuf` (the OTLP wire format) and is the supported exporter for Dynatrace.

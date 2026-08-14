@@ -8,84 +8,130 @@
  *   { model, messages, temperature, max_tokens, ... }
  */
 
+const { trace, SpanStatusCode } = require('@opentelemetry/api');
+const http = require('http');
+const https = require('https');
+const { cache } = require('./cache');
+
+const tracer = trace.getTracer('ai-litellm', '1.0.0');
 const DEFAULT_TIMEOUT_MS = 60000;
 const problemAnalysis = require('./problemAnalysis');
 
+// Reuse TLS connections to the LiteLLM gateway.
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 16, scheduling: 'lifo' });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 16 });
+
 async function listModels(cfg) {
   if (!cfg.baseUrl) throw new Error('AI_BASE_URL is not configured');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
-  const url = new URL('v1/models', cfg.baseUrl.endsWith('/') ? cfg.baseUrl : cfg.baseUrl + '/').toString();
-  try {
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${cfg.apiKey}`,
-        Accept: 'application/json',
-      },
-      signal: controller.signal,
-    });
-    const text = await res.text();
-    if (!res.ok) {
-      throw new Error(`AI /models ${res.status}: ${text}`);
+  const key = 'listModels:' + cfg.baseUrl;
+  const TTL_MS = 60_000; // 60s — model list is essentially static
+
+  return tracer.startActiveSpan('cache.listModels', async (span) => {
+    span.setAttribute('cache.key', key);
+    try {
+      const { value, hit } = await cache.getOrLoad(key, TTL_MS, async () => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+        const url = new URL('v1/models', cfg.baseUrl.endsWith('/') ? cfg.baseUrl : cfg.baseUrl + '/').toString();
+        try {
+          const res = await fetch(url, {
+            method: 'GET',
+            agent: url.startsWith('https') ? httpsAgent : httpAgent,
+            headers: {
+              Authorization: `Bearer ${cfg.apiKey}`,
+              Accept: 'application/json',
+            },
+            signal: controller.signal,
+          });
+          const text = await res.text();
+          if (!res.ok) {
+            const err = new Error(`AI /models ${res.status}: ${text}`);
+            err.status = res.status;
+            throw err;
+          }
+          return JSON.parse(text);
+        } finally {
+          clearTimeout(timer);
+        }
+      });
+      span.setAttribute('cache.hit', hit);
+      return value;
+    } finally {
+      span.end();
     }
-    return JSON.parse(text);
-  } finally {
-    clearTimeout(timer);
-  }
+  });
 }
 
 /**
  * Run a chat completion against the LiteLLM-compatible endpoint.
  */
 async function chatCompletion(cfg, messages, options = {}) {
-  if (!cfg.baseUrl) throw new Error('AI_BASE_URL is not configured');
-  if (!cfg.apiKey) throw new Error('AI_API_KEY is not configured');
-  if (!cfg.model) throw new Error('AI_MODEL is not configured');
+  return tracer.startActiveSpan('ai.chat', async (span) => {
+    if (!cfg.baseUrl) { span.end(); throw new Error('AI_BASE_URL is not configured'); }
+    if (!cfg.apiKey) { span.end(); throw new Error('AI_API_KEY is not configured'); }
+    if (!cfg.model)  { span.end(); throw new Error('AI_MODEL is not configured'); }
 
-  const url = new URL(
-    'v1/chat/completions',
-    cfg.baseUrl.endsWith('/') ? cfg.baseUrl : cfg.baseUrl + '/'
-  ).toString();
+    span.setAttribute('ai.model', cfg.model);
+    span.setAttribute('ai.temperature', options.temperature ?? 0.3);
+    if (options.maxTokens) span.setAttribute('ai.max_tokens', options.maxTokens);
+    span.setAttribute('ai.message_count', messages.length);
 
-  const body = {
-    model: cfg.model,
-    messages,
-    temperature: options.temperature ?? 0.3,
-  };
-  if (options.maxTokens) body.max_tokens = options.maxTokens;
-  if (options.json) body.response_format = { type: 'json_object' };
+    const url = new URL(
+      'v1/chat/completions',
+      cfg.baseUrl.endsWith('/') ? cfg.baseUrl : cfg.baseUrl + '/'
+    ).toString();
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs || DEFAULT_TIMEOUT_MS);
+    const body = {
+      model: cfg.model,
+      messages,
+      temperature: options.temperature ?? 0.3,
+    };
+    if (options.maxTokens) body.max_tokens = options.maxTokens;
+    if (options.json) body.response_format = { type: 'json_object' };
 
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${cfg.apiKey}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), options.timeoutMs || DEFAULT_TIMEOUT_MS);
 
-    const text = await res.text();
-    if (!res.ok) {
-      let detail = text;
-      try { detail = JSON.parse(text); } catch { /* keep raw text */ }
-      const err = new Error(
-        'AI chat ' + res.status + ': ' + (typeof detail === 'string' ? detail : JSON.stringify(detail))
-      );
-      err.status = res.status;
-      err.body = detail;
-      throw err;
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        agent: url.startsWith('https') ? httpsAgent : httpAgent,
+        headers: {
+          Authorization: `Bearer ${cfg.apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      span.setAttribute('http.status_code', res.status);
+
+      const text = await res.text();
+      if (!res.ok) {
+        let detail = text;
+        try { detail = JSON.parse(text); } catch { /* keep raw text */ }
+        const err = new Error(
+          'AI chat ' + res.status + ': ' + (typeof detail === 'string' ? detail : JSON.stringify(detail))
+        );
+        err.status = res.status;
+        err.body = detail;
+        span.recordException(err);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+        throw err;
+      }
+      const parsed = JSON.parse(text);
+      if (parsed.usage) {
+        span.setAttribute('ai.usage.prompt_tokens', parsed.usage.prompt_tokens || 0);
+        span.setAttribute('ai.usage.completion_tokens', parsed.usage.completion_tokens || 0);
+        span.setAttribute('ai.usage.total_tokens', parsed.usage.total_tokens || 0);
+      }
+      return parsed;
+    } finally {
+      clearTimeout(timer);
+      span.end();
     }
-    return JSON.parse(text);
-  } finally {
-    clearTimeout(timer);
-  }
+  });
 }
 
 /**

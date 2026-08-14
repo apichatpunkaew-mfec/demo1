@@ -5,3 +5,7 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 *.log
+*.err
+server.log
+server.err
+debug.log

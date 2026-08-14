@@ -1,5 +1,9 @@
 'use strict';
 
+// Bootstrap OpenTelemetry BEFORE any other require. tracing.js loads .env
+// for us and registers instrumentations for express / undici / http.
+require('./tracing');
+
 /**
  * Dynatrace AI Dashboard
  * -----------------------
@@ -7,9 +11,14 @@
  *   - serves the static UI in /public
  *   - exposes a small JSON API around the Dynatrace Problems v2 endpoint
  *     and the LiteLLM-compatible chat endpoint configured in .env
+ *
+ * Performance features:
+ *   - In-memory TTL cache on problems + models (services/cache.js,
+ *     services/dynatrace.js, services/ai.js)
+ *   - Reused TLS connections to Dynatrace + OpenAI-compatible gateway
+ *   - Parallel LLM calls in /api/analyze-all with bounded concurrency
+ *   - Cache-Control headers on GETs so the browser/proxy can cache too
  */
-
-require('dotenv').config();
 
 const path = require('path');
 const express = require('express');
@@ -19,6 +28,13 @@ const ai = require('./services/ai');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
+
+// Performance tunables
+const ANALYZE_CONCURRENCY = Math.max(1, parseInt(process.env.ANALYZE_CONCURRENCY || '3', 10));
+const DEFAULT_PROBLEM_PAGE_SIZE = parseInt(process.env.DEFAULT_PROBLEM_PAGE_SIZE || '10', 10);
+const PROBLEMS_CACHE_MAX_AGE = 10;     // seconds - browser-side cache
+const PROBLEMS_SWR = 30;               // stale-while-revalidate seconds
+const MODELS_CACHE_MAX_AGE = 60;
 
 const dtCfg = {
   baseUrl: process.env.DYNATRACE_BASE_URL || '',
@@ -68,6 +84,25 @@ function summarizeProblems(payload) {
   };
 }
 
+/**
+ * Bounded-concurrency runner. Like Promise.all but never more than `limit`
+ * tasks in flight at once. Preserves the input order in the result array.
+ */
+async function mapWithConcurrency(items, limit, mapper) {
+  const out = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await mapper(items[i], i);
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return out;
+}
+
 /* ------------------------------ API ------------------------------- */
 
 app.get('/api/health', (_req, res) => {
@@ -78,32 +113,34 @@ app.get('/api/health', (_req, res) => {
     time: new Date().toISOString(),
   });
 });
-
 // List problems
 app.get('/api/problems', asyncHandler(async (req, res) => {
   const q = req.query;
   const opts = {
     status: q.status || process.env.DEFAULT_PROBLEM_STATUS || '',
     severityLevel: q.severity || process.env.DEFAULT_PROBLEM_SEVERITY || '',
-    pageSize: parseInt(q.pageSize || process.env.DEFAULT_PROBLEM_PAGE_SIZE || '20', 10),
+    pageSize: parseInt(q.pageSize || process.env.DEFAULT_PROBLEM_PAGE_SIZE || DEFAULT_PROBLEM_PAGE_SIZE, 10),
     from: q.from || '',
     to: q.to || '',
     nextPageKey: q.nextPageKey || '',
   };
   Object.keys(opts).forEach((k) => { if (opts[k] === '' || opts[k] === undefined) delete opts[k]; });
   const data = await dynatrace.listProblems(dtCfg, opts);
+  res.set('Cache-Control', 'private, max-age=' + PROBLEMS_CACHE_MAX_AGE + ', stale-while-revalidate=' + PROBLEMS_SWR);
   res.json({ ...data, summary: summarizeProblems(data) });
 }));
 
 // Get a single problem (with details + comments if available)
 app.get('/api/problems/:problemId', asyncHandler(async (req, res) => {
   const data = await dynatrace.getProblem(dtCfg, req.params.problemId);
+  res.set('Cache-Control', 'private, max-age=' + PROBLEMS_CACHE_MAX_AGE);
   res.json(data);
 }));
 
 // AI: list available models
 app.get('/api/models', asyncHandler(async (_req, res) => {
   const data = await ai.listModels(aiCfg);
+  res.set('Cache-Control', 'public, max-age=' + MODELS_CACHE_MAX_AGE);
   res.json(data);
 }));
 
@@ -134,8 +171,7 @@ app.get('/api/analyze/:problemId', asyncHandler(async (req, res) => {
   });
   res.json({ problem, analysis: result });
 }));
-
-// AI: batch analyze (default: OPEN problems, first N)
+// AI: batch analyze (default: OPEN problems, first N). Parallel, bounded concurrency.
 app.post('/api/analyze-all', asyncHandler(async (req, res) => {
   const body = req.body || {};
   const limit = Math.min(parseInt(body.limit != null ? body.limit : '5', 10), 25);
@@ -147,15 +183,14 @@ app.post('/api/analyze-all', asyncHandler(async (req, res) => {
   const override = body.model || '';
   const cfg = override ? { ...aiCfg, model: override } : aiCfg;
 
-  const results = [];
-  for (const p of problems) {
+  const results = await mapWithConcurrency(problems, ANALYZE_CONCURRENCY, async (p) => {
     try {
-      const r = await ai.analyzeProblem(cfg, p, { temperature: 0.2 });
-      results.push({ ok: true, problem: p, analysis: r });
+      const r = await ai.analyzeProblem(cfg, p, { temperature: 0.2, timeoutMs: 45000 });
+      return { ok: true, problem: p, analysis: r };
     } catch (e) {
-      results.push({ ok: false, problem: p, error: e.message });
+      return { ok: false, problem: p, error: e.message };
     }
-  }
+  });
 
   res.json({ count: results.length, results });
 }));
@@ -185,4 +220,6 @@ app.listen(PORT, HOST, () => {
   console.log('Dynatrace AI Dashboard listening on http://' + HOST + ':' + PORT);
   console.log('  Dynatrace:', dtCfg.baseUrl || '(not configured)', 'token=', maskToken(dtCfg.token));
   console.log('  AI:       ', aiCfg.baseUrl || '(not configured)', 'model=', aiCfg.model || '(unset)');
+  console.log('  tune:     analyze_concurrency=' + ANALYZE_CONCURRENCY +
+              ' default_page_size=' + DEFAULT_PROBLEM_PAGE_SIZE);
 });
