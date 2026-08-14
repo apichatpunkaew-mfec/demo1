@@ -1,0 +1,25 @@
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "dynatracePlatformToken",
+      "description": "Dynatrace Platform Token (Bearer JWT) for waa41263.apps.dynatrace.com — create one at Account Settings > Personal tokens, or in Platform Identity > OAuth clients.",
+      "password": true
+    }
+  ],
+  "servers": {
+    "dynatrace": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@dynatrace-oss/dynatrace-mcp-server@1.8.7"
+      ],
+      "env": {
+        "DT_ENVIRONMENT": "https://waa41263.apps.dynatrace.com",
+        "DT_PLATFORM_TOKEN": "${input:dynatracePlatformToken}",
+        "DT_MCP_DISABLE_TELEMETRY": "true"
+      }
+    }
+  }
+}
