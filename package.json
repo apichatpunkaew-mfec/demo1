@@ -1,0 +1,20 @@
+{
+  "name": "dynatrace-ai-dashboard",
+  "version": "1.0.0",
+  "description": "Node.js web app that fetches Dynatrace problems and analyzes them with an LLM (LiteLLM-compatible).",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  },
+  "author": "",
+  "license": "MIT"
+}

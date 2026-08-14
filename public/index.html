@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Dynatrace + AI Dashboard</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <span>Dynatrace <span class="muted">+</span> AI</span>
+    </div>
+    <nav class="actions">
+      <button id="btn-refresh" class="btn">Refresh</button>
+      <button id="btn-analyze-all" class="btn primary" title="Analyze current problem list with AI">Analyze all (open)</button>
+      <label class="model-picker">
+        Model
+        <select id="model-select"></select>
+      </label>
+    </nav>
+  </header>
+
+  <section class="health" id="health"></section>
+
+  <section class="filters">
+    <label>
+      Status
+      <select id="filter-status">
+        <option value="">All</option>
+        <option value="OPEN" selected>OPEN</option>
+        <option value="CLOSED">CLOSED</option>
+      </select>
+    </label>
+    <label>
+      Severity
+      <select id="filter-severity">
+        <option value="">Any</option>
+        <option value="AVAILABILITY">AVAILABILITY</option>
+        <option value="ERROR">ERROR</option>
+        <option value="PERFORMANCE">PERFORMANCE</option>
+        <option value="RESOURCE_CONTENTION">RESOURCE_CONTENTION</option>
+        <option value="MONITORING_UNAVAILABLE">MONITORING_UNAVAILABLE</option>
+        <option value="CUSTOM_ALERT">CUSTOM_ALERT</option>
+        <option value="INFORMATION">INFORMATION</option>
+      </select>
+    </label>
+    <label>
+      Page size
+      <select id="filter-pagesize">
+        <option>10</option>
+        <option selected>20</option>
+        <option>50</option>
+        <option>100</option>
+      </select>
+    </label>
+  </section>
+
+  <section class="summary" id="summary"></section>
+
+  <main>
+    <table class="problems" id="problems-table">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Title</th>
+          <th>Severity</th>
+          <th>Status</th>
+          <th>Affected</th>
+          <th>Started</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="problems-tbody">
+        <tr><td colspan="7" class="empty">Loading&hellip;</td></tr>
+      </tbody>
+    </table>
+  </main>
+
+  <!-- Analysis modal -->
+  <div class="modal hidden" id="modal" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <header>
+        <h2 id="modal-title">AI Analysis</h2>
+        <button class="close" id="modal-close" aria-label="Close">&times;</button>
+      </header>
+      <div class="modal-body" id="modal-body">Loading&hellip;</div>
+    </div>
+  </div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
