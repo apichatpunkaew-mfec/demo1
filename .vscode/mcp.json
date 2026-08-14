@@ -2,8 +2,8 @@
   "inputs": [
     {
       "type": "promptString",
-      "id": "dynatracePlatformToken",
-      "description": "Dynatrace Platform Token (Bearer JWT) for waa41263.apps.dynatrace.com — create one at Account Settings > Personal tokens, or in Platform Identity > OAuth clients.",
+      "id": "dynatraceOAuthClientSecret",
+      "description": "Dynatrace OAuth Client Secret (dt0s02.*). Create an OAuth client in Account > Identity & access > OAuth clients with the scopes listed in MCP_SETUP.md. The client ID is hardcoded below for reference; only the secret is prompted.",
       "password": true
     }
   ],
@@ -17,7 +17,9 @@
       ],
       "env": {
         "DT_ENVIRONMENT": "https://waa41263.apps.dynatrace.com",
-        "DT_PLATFORM_TOKEN": "${input:dynatracePlatformToken}",
+        "DT_SSO_URL": "https://sso.dynatrace.com",
+        "OAUTH_CLIENT_ID": "dt0s02.GANJVRPD",
+        "OAUTH_CLIENT_SECRET": "${input:dynatraceOAuthClientSecret}",
         "DT_MCP_DISABLE_TELEMETRY": "true"
       }
     }

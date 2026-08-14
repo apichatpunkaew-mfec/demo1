@@ -1,127 +1,155 @@
 # Dynatrace MCP Server — VS Code setup
 
-This repo already includes `.vscode/mcp.json` that registers the official
-**Dynatrace MCP Server** for VS Code. Once you supply a Platform Token (see
-below) and reload VS Code, the AI assistant (Copilot Chat, Claude Code, etc.)
-will get a set of tools for problems, metrics, logs, traces, entities, etc.
+This repo ships `.vscode/mcp.json` registering the **Dynatrace MCP Server**
+(`@dynatrace-oss/dynatrace-mcp-server@1.8.7`) for VS Code. After VS Code
+reads the config and you paste the OAuth client secret at the first-launch
+prompt, the AI assistant (Copilot Chat, Claude Code, etc.) gets a set of
+tools for **traces, metrics, logs, entities, DQL**, etc.
 
-> ⚠️ The `dynatrace-oss/dynatrace-mcp` repo is now **deprecated** (final
-> release `v2.1.2`, July 2025). It still works. Recommended alternatives:
+> ⚠️ `dynatrace-oss/dynatrace-mcp` is in **maintenance mode** (final release
+> `v2.1.2`, July 2025). Alternatives for new projects:
 >
-> - **Local dev (this project)**: [Dynatrace-for-AI](https://github.com/Dynatrace/dynatrace-for-ai/) + [`dtctl`](https://github.com/Dynatrace/dynatrace-mcp)
+> - **Local dev (this project)**: [`Dynatrace-for-AI`](https://github.com/Dynatrace/dynatrace-for-ai/) + [`dtctl`](https://github.com/Dynatrace/dynatrace-mcp)
 > - **Remote (zero setup)**: [Dynatrace Remote MCP Server](https://www.dynatrace.com/hub/detail/dynatrace-mcp-server/)
-
-This guide keeps using the deprecated package because it is the only one
-that matches the **Node.js version on this machine (`v22.19.0`)** — the
-latest `v2.x` requires Node 24+.
+>
+> We pin `v1.8.7` here because it needs Node ≥22.10 (this machine has
+> `v22.19.0` ✅); `v2.x` requires Node 24+.
 
 ## What's installed
 
 | Path              | Purpose                                                  |
 | ----------------- | -------------------------------------------------------- |
-| `.vscode/mcp.json`| VS Code MCP server registration (stdio, `npx -y …@1.8.7`)|
+| `.vscode/mcp.json`| VS Code MCP registration (stdio, `npx -y …@1.8.7`, **OAuth client-credentials**) |
 | `MCP_SETUP.md`    | This file                                                |
 
-No `npm install` is needed — VS Code (via `npx -y …@1.8.7`) downloads the
-package on first launch and caches it.
+No `npm install` is needed — VS Code pulls the package on first launch
+via `npx -y`.
 
-## 1. Get a Dynatrace Platform Token
+## 1. Authentication choice — OAuth Client Credentials
 
-The MCP server uses Dynatrace **Platform** APIs (`*.apps.dynatrace.com`),
-not classic cluster APIs (`*.live.dynatrace.com`). It therefore needs a
-**Bearer token** (Platform Token / OAuth client), NOT a classic Api-Token.
+The MCP server hits Dynatrace **Platform APIs** (`*.apps.dynatrace.com`),
+not classic cluster APIs (`*.live.dynatrace.com`). Two auth options:
 
-The token currently in `.env` (`dt0c01…`) is an **Api-Token** and will NOT
-work — Dynatrace returns `401 Could not parse JWT`.
+| Method                  | What goes in mcp.json                                       | Notes                                                                 |
+| ----------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------- |
+| **Platform Token**      | `DT_PLATFORM_TOKEN=<long JWT starting with eyJ…>`           | Easiest, single static secret.                                        |
+| **OAuth Client Creds** ✅| `OAUTH_CLIENT_ID=dt0s02.xxxxx` + `OAUTH_CLIENT_SECRET=…`    | Short-lived JWT auto-refreshed every 5 min; secret never expires.     |
 
-Create one of:
+This project uses **OAuth** because an OAuth client was already
+provisioned (`OAUTH_CLIENT_ID=dt0s02.GANJVRPD`). The **secret** is stored
+only in VS Code's keychain via the `promptString` input — it is **never
+written to a tracked file**.
 
-### Option A — Platform Token (recommended)
+### Scopes granted to this OAuth client
 
-1. In Dynatrace: **Account Settings → Personal Information → Personal tokens**
-   (or in SaaS: **Account → Identity & access → OAuth clients**).
-2. Create a new token with **at least** these scopes:
+Direct probe (`grant_type=client_credentials`, no scope requested) returns
+**214 scopes** (admin-level). Key ones for MCP usage:
 
-   ```
-   app-engine:apps:run          (mandatory)
-   read:problems                (problems/details API)
-   storage:logs:read            (logs DQL)
-   storage:metrics:read         (metrics DQL)
-   storage:spans:read           (traces/spans DQL)  ← needed for tracing questions
-   storage:bizevents:read       (Davis, bizevents)
-   storage:events:read
-   storage:entities:read
-   hub:catalog:read
-   ```
+```
+✅  app-engine:apps:run           (required for any MCP call)
+✅  storage:spans:read            (TRACES — answers "which trace is slowest")
+✅  storage:logs:read             (logs DQL)
+✅  storage:metrics:read          (metrics DQL)
+✅  storage:entities:read         (entities)
+✅  storage:events:read
+✅  storage:bizevents:read
+✅  hub:catalog:read
+✅  environment-api:problems:read
+❌  read:problems                 (legacy problems scope — NOT granted)
+```
 
-   While testing you can grant `hub:admin` and narrow down later.
-
-3. Copy the token (a long JWT starting with `eyJ…`).
-
-### Option B — OAuth client credentials
-
-1. Create an OAuth client (Account → Identity & access → OAuth clients).
-2. Add `DT_CLIENT_ID`, `DT_CLIENT_SECRET`, `DT_RESOURCE` to the `env` in
+> ⚠️ **Known limitation:** the MCP server's `get-problems` tool requests
+> the legacy scope `read:problems`, which **this OAuth client does NOT
+> have** (it only has `environment-api:problems:read`). That tool will
+> fail with `400 Bad Request` until either the OAuth client's allowed
+> scopes are updated, or the upstream MCP server is fixed.
+>
+> For everything else — **DQL against spans, logs, metrics, entities,
 ## 2. Open the project in VS Code
 
 ```powershell
 code C:\Users\User\Desktop\app\demo1\demo1-1
 ```
 
-VS Code reads `.vscode/mcp.json` automatically. On first run the MCP server
-is started in the background; because the config uses
-`${input:dynatracePlatformToken}` you will be prompted for the token once
-and VS Code remembers it in the OS keychain.
+VS Code reads `.vscode/mcp.json` automatically. On first run the MCP
+server is started in the background; because the config uses
+`${input:dynatraceOAuthClientSecret}`, **VS Code prompts for the secret
+once** and stores it in the OS keychain.
 
-## 3. Verify
+The expected startup banner (verified locally):
+
+```
+Initializing Dynatrace MCP Server v1.8.7...
+Dynatrace Telemetry initialization failed: Dynatrace Telemetry is disabled via DT_MCP_DISABLE_TELEMETRY=true
+Testing connection to Dynatrace environment: https://waa41263.apps.dynatrace.com...
+🔒 Client-Creds-Flow: Trying to authenticate API Calls ... via OAuthClientId dt0s02.GANJVRPD ...
+Using SSO URL from DT_SSO_URL environment variable: https://sso.dynatrace.com
+Successfully retrieved token from SSO! Token valid for 300s with scopes: app-engine:apps:run
+✅ Successfully connected to the Dynatrace environment at https://waa41263.apps.dynatrace.com.
+Dynatrace MCP Server running on stdio
+```
+
+## 3. Verify in Copilot Chat
 
 In VS Code:
 
 1. **Command Palette → `MCP: List Servers`** — `dynatrace` should show
-   status **Running** with `n` tools available.
-2. Click on it → **Start** if not started.
-3. In Copilot Chat (agent mode), ask:
-   - *"List the open problems in this Dynatrace tenant."*
+   status **Running** with ~50 tools.
+2. In **Copilot Chat** (agent mode), ask:
    - *"What was the slowest trace in the last hour?"*
+     → MCP uses `execute-dql` to run
+     `fetch spans, from:now()-1h | sort duration desc | limit 10`
    - *"Show me logs with `error` from service X."*
+   - *"List the entities of type service."*
 
-You should see MCP tool calls appear in the conversation
-(`get-problems`, `get-traces`, `execute-dql`, …).
+You should see MCP tool calls appear inline in the chat.
 
 ## 4. Manual smoke test (no VS Code)
 
 ```powershell
+# Use full path to npx because node/npx are not in the system PATH by default:
+$nodeDir = "C:\Users\User\AppData\Local\Temp\node\node-v22.19.0-win-x64"
+$env:PATH = $nodeDir + ";" + $env:PATH
+
 $env:DT_ENVIRONMENT      = "https://waa41263.apps.dynatrace.com"
-$env:DT_PLATFORM_TOKEN   = "<paste token>"
+$env:DT_SSO_URL          = "https://sso.dynatrace.com"
+$env:OAUTH_CLIENT_ID     = "dt0s02.GANJVRPD"
+$env:OAUTH_CLIENT_SECRET = "<paste secret>"
 $env:DT_MCP_DISABLE_TELEMETRY = "true"
-npx -y @dynatrace-oss/dynatrace-mcp-server@1.8.7 --help
+
+& "$nodeDir\npx.cmd" -y @dynatrace-oss/dynatrace-mcp-server@1.8.7 --help
 ```
 
-Expected startup banner:
-
-```
-Initializing Dynatrace MCP Server v1.8.7...
-Dynatrace Telemetry initialization failed: Dynatrace Telemetry is disabled ...
-Testing connection to Dynatrace environment: https://waa41263.apps.dynatrace.com...
-Using Platform Token to authenticate API Calls to https://waa41263.apps.dynatrace.com
-```
-
-If authentication fails you'll see `401 Unauthorized` from
-`/platform/management/v1/environment` — check the token scopes.
+Look for the `✅ Successfully connected` banner above.
 
 ## 5. Troubleshooting
 
 | Symptom                                                       | Fix                                                                                                            |
 | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `401 Unsupported authorization scheme 'Api-Token'`            | You're using a classic Api-Token. Switch to a Platform Token (Bearer JWT).                                     |
-| `401 Could not parse JWT`                                     | Token is malformed/expired.                                                                                    |
-| `403 forbidden by administrative rules`                       | Tenant blocks storage APIs. Ask your admin to enable Grail access, or use Remote MCP.                         |
+| `401 Unsupported authorization scheme 'Api-Token'`            | Classic Api-Token won't work. Use a Platform Token (Bearer JWT) **or** OAuth client credentials.                |
+| `400 invalid_request` from `sso.dynatrace.com`                | OAuth client lacks one of the requested scopes. Run a no-scope token request and grep the returned scope list. |
+| `400 Bad Request` from `get-problems`                         | This OAuth client lacks `read:problems`. See scope warning above.                                               |
+| `403 forbidden by administrative rules`                       | Tenant blocks storage APIs. Ask admin to enable Grail access, or use Remote MCP.                               |
 | `npm warn deprecated @dynatrace-oss/dynatrace-mcp-server@1.8.7` | Expected — see deprecation notice at top of file.                                                            |
-| `EACCES` / `EPERM` on first run                                | VS Code's bundled Node may be sandboxed. Run the smoke test manually first to warm `npx` cache.                |
-| Server won't start because Node 24 required                    | `v2.x` of this package requires Node 24. We pin `1.8.7` (Node ≥22.10) — confirm `node --version`.               |
+| `"node" is not recognized`                                    | VS Code / shell PATH missing the node binary. This machine has it under `C:\Users\User\AppData\Local\Temp\node\node-v22.19.0-win-x64` — prefix the launch with `$env:PATH = $nodeDir + ";" + $env:PATH`. |
+| Server won't start because Node 24 required                   | `v2.x` of this package requires Node 24. We pin `1.8.7` (Node ≥22.10) — confirm `node --version`.              |
 
-## 6. Removing the integration
+## 6. Rotating the OAuth client secret
+
+Because the OAuth client secret is currently **exposed in the chat history
+and several test scripts on this machine**:
+
+1. In Dynatrace → **Account → Identity & access → OAuth clients**,
+   regenerate the secret for `dt0s02.GANJVRPD`.
+2. VS Code will keep the old secret in its keychain. To re-prompt:
+   - **Command Palette → `MCP: List Servers`** → click `dynatrace` →
+     **Reset stored inputs** (or delete the entry from
+     `Credential Manager` → `VSCode MCP Secrets`).
+3. Restart VS Code. The MCP server will prompt again for the new secret.
+
+## 7. Removing the integration
 
 Just delete `.vscode/mcp.json` and reload VS Code. The downloaded package
-in `~/.npm/_npx/` will be re-used by other projects but is harmless.
-   `.vscode/mcp.json` and remove `DT_PLATFORM_TOKEN`.
+in `~/.npm/_npx/` is harmless and will be reused by other projects.
+> events** — works out of the box. This is exactly what's needed to
+> answer the original "which trace is the slowest" question.

@@ -142,24 +142,24 @@ If you see the model picker empty in the UI, hit `/api/health` to confirm the AI
 
 ## Dynatrace MCP Server (VS Code / Copilot)
 
-For AI-assisted queries against Dynatrace (problems, logs, metrics,
-**traces**, entities, DQL), this repo ships a preconfigured
-**`.vscode/mcp.json`** that registers the official `dynatrace-mcp-server`.
-See **[`MCP_SETUP.md`](MCP_SETUP.md)** for the full guide.
+For AI-assisted queries against Dynatrace (**traces, logs, metrics,
+entities, DQL**), this repo ships a preconfigured **`.vscode/mcp.json`**
+that registers the official `dynatrace-mcp-server`. Authentication uses
+**OAuth client-credentials** (the secret is prompted once and stored in
+the VS Code keychain — never written to a tracked file).
+
+See **[`MCP_SETUP.md`](MCP_SETUP.md)** for the full guide, including the
+known scope limitation (`read:problems` is not granted to this OAuth
+client, so the `get-problems` MCP tool returns 400).
 
 Quick start:
 
 ```powershell
-code C:\Users\User\Desktop\app\demo1\demo1-1   # opens VS Code with MCP config
-# VS Code prompts for a Platform Token once; Copilot Chat then has:
-#   - "List open problems"
+code C:\Users\User\Desktop\app\demo1\demo1-1
+# VS Code prompts for the OAuth client secret once; Copilot Chat then has:
 #   - "What was the slowest trace in the last hour?"
 #   - "Run this DQL: fetch logs, from:now()-1h | filter status=\"error\""
 ```
-
-> Note: the MCP server uses **Platform APIs** (`*.apps.dynatrace.com`) and
-> therefore requires a **Platform Token (Bearer JWT)**, not the classic
-> Api-Token that the dashboard app uses.
 
 ---
 
