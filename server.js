@@ -61,7 +61,22 @@ function maskToken(t) {
 }
 
 function asyncHandler(fn) {
-  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch((err) => {
+    // Try to attach the exception to the active OTel span (if any) before
+    // handing off to Express's error middleware. Express auto-instrumentation
+    // closes the request span only after `next(err)` is invoked, so this
+    // still attributes the error to the request span.
+    try {
+      // eslint-disable-next-line global-require
+      const { trace, SpanStatusCode } = require('@opentelemetry/api');
+      const span = trace.getActiveSpan();
+      if (span) {
+        span.recordException(err);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      }
+    } catch { /* OTel not loaded - ignore */ }
+    next(err);
+  });
 }
 
 function summarizeProblems(payload) {

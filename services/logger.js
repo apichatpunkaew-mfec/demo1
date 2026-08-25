@@ -18,6 +18,25 @@
 
 const { trace, context } = require('@opentelemetry/api');
 
+// Lazily resolve the OTel log provider. Loaded only after tracing.js has
+// initialised the SDK, so the shared OTLP log exporter picks up our records.
+let logProvider = null;
+let logSent = 0;
+let logSendFailures = 0;
+function getLogger() {
+  if (logProvider) return logProvider.getLogger('dynatrace-ai-dashboard');
+  try {
+    // eslint-disable-next-line global-require
+    const logs = require('@opentelemetry/api-logs');
+    // The sdk-logs BatchLogRecordProcessor attaches the provider globally
+    // once NodeSDK starts. We only need the API handle here.
+    logProvider = logs;
+    return logs.getLogger('dynatrace-ai-dashboard');
+  } catch {
+    return null;
+  }
+}
+
 const SERVICE = process.env.OTEL_SERVICE_NAME || 'dynatrace-ai-dashboard';
 const HOST = process.env.HOSTNAME || require('os').hostname();
 
@@ -56,6 +75,32 @@ function emit(level, event, fields, err) {
       stack: err.stack,
     };
   }
+
+  // SeverityText mapping (OTLP logs spec) — severity_number is optional but
+  // useful for Dynatrace log queries / alerting.
+  const sev = level === 'error' ? 17 : level === 'warn' ? 13 : level === 'info' ? 9 : 5;
+
+  // Send via OTLP logs if SDK is loaded.
+  try {
+    const { logs: logsApi } = require('@opentelemetry/api-logs');
+    const logger = logsApi.getLogger(SERVICE);
+    logger.emit({
+      severityText: level.toUpperCase(),
+      severityNumber: sev,
+      body: event,
+      attributes: record,
+      timestamp: Date.now() * 1000000, // OTLP requires nanoseconds
+    });
+    logSent += 1;
+  } catch (e) {
+    logSendFailures += 1;
+    if (logSendFailures <= 3) {
+      // eslint-disable-next-line no-console
+      console.error('[logger] OTLP send failed:', e.message);
+    }
+  }
+
+  // Mirror to stdout/stderr so local `node server.js` still shows readable logs.
   const line = JSON.stringify(record) + '\n';
   if (level === 'error' || level === 'warn') process.stderr.write(line);
   else process.stdout.write(line);
