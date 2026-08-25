@@ -12,6 +12,7 @@ const { trace, SpanStatusCode } = require('@opentelemetry/api');
 const http = require('http');
 const https = require('https');
 const { cache } = require('./cache');
+const log = require('./logger');
 
 const tracer = trace.getTracer('ai-litellm', '1.0.0');
 const DEFAULT_TIMEOUT_MS = 60000;
@@ -22,7 +23,12 @@ const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 16, scheduling
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 16 });
 
 async function listModels(cfg) {
-  if (!cfg.baseUrl) throw new Error('AI_BASE_URL is not configured');
+  if (!cfg.baseUrl) {
+    log.error('ai.config.missing', { field: 'AI_BASE_URL' });
+    const err = new Error('AI_BASE_URL is not configured');
+    err.code = 'CONFIG_MISSING';
+    throw err;
+  }
   const key = 'listModels:' + cfg.baseUrl;
   const TTL_MS = 60_000; // 60s — model list is essentially static
 
@@ -47,9 +53,28 @@ async function listModels(cfg) {
           if (!res.ok) {
             const err = new Error(`AI /models ${res.status}: ${text}`);
             err.status = res.status;
+            span.recordException(err);
+            span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+            log.error('ai.listModels.http_error', { url, status: res.status, statusText: res.statusText }, err);
             throw err;
           }
           return JSON.parse(text);
+        } catch (e) {
+          if (e.name === 'AbortError') {
+            const err = new Error(`AI /models timed out after ${DEFAULT_TIMEOUT_MS}ms`);
+            err.code = 'TIMEOUT';
+            span.recordException(err);
+            span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+            log.error('ai.listModels.timeout', { url, timeoutMs: DEFAULT_TIMEOUT_MS }, err);
+            throw err;
+          }
+          if (!e.status) {
+            // Network-level error: capture trace_id/span_id via OTel + structured log.
+            span.recordException(e);
+            span.setStatus({ code: SpanStatusCode.ERROR, message: e.message });
+            log.error('ai.listModels.network_error', { url }, e);
+          }
+          throw e;
         } finally {
           clearTimeout(timer);
         }

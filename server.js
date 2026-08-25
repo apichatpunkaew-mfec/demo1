@@ -25,6 +25,7 @@ const express = require('express');
 
 const dynatrace = require('./services/dynatrace');
 const ai = require('./services/ai');
+const log = require('./services/logger');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -205,8 +206,20 @@ app.use((req, res) => {
 });
 
 app.use((err, _req, res, _next) => {
-  // eslint-disable-next-line no-console
-  console.error('[error]', err.message);
+  // Mark the active span as ERROR so Dynatrace can pivot logs <-> traces,
+  // emit a structured log line, then return a JSON response.
+  // eslint-disable-next-line global-require
+  const { trace, SpanStatusCode } = require('@opentelemetry/api');
+  const span = trace.getActiveSpan();
+  if (span) {
+    span.recordException(err);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+  }
+  log.error('http.error', {
+    path: _req.path,
+    method: _req.method,
+    status: err.status || 500,
+  }, err);
   res.status(err.status || 500).json({
     error: err.message || 'Internal Server Error',
     detail: err.body || null,
@@ -214,6 +227,21 @@ app.use((err, _req, res, _next) => {
 });
 
 /* ----------------------------- boot ------------------------------ */
+
+// Last-resort safety net: log instead of crashing on stray rejections.
+// Node 22 treats any unhandled rejection as fatal by default; we prefer a
+// structured log line so a tail-latency bug doesn't take down the dashboard.
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  // eslint-disable-next-line global-require
+  const { trace, SpanStatusCode } = require('@opentelemetry/api');
+  const span = trace.getActiveSpan();
+  if (span) {
+    span.recordException(err);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+  }
+  log.error('process.unhandledRejection', {}, err);
+});
 
 app.listen(PORT, HOST, () => {
   // eslint-disable-next-line no-console

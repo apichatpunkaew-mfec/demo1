@@ -14,6 +14,7 @@ const { trace, SpanStatusCode } = require('@opentelemetry/api');
 const http = require('http');
 const https = require('https');
 const { cache } = require('./cache');
+const log = require('./logger');
 
 const tracer = trace.getTracer('dynatrace-rest', '1.0.0');
 const DEFAULT_TIMEOUT_MS = 20000;
@@ -152,17 +153,21 @@ async function getProblem(cfg, problemId) {
 }
 
 /**
- * Try to fetch entity names for affected entity IDs. Best effort; failures are swallowed.
+ * Try to fetch entity names for affected entity IDs. Best effort; failures are
+ * logged as warnings (with trace_id) so we don't lose visibility in Dynatrace,
+ * but the caller still falls back to whatever was embedded in the problem
+ * payload.
  */
 async function getEntities(cfg, ids = []) {
   if (!ids.length) return [];
   const out = [];
   const chunkSize = 50;
+  const uniqueTypes = [...new Set(ids.map((c) => c.type).filter(Boolean))];
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i, i + chunkSize);
     try {
       const body = await dynatraceFetch(cfg.baseUrl, cfg.token, 'api/v2/entities', {
-        entitySelector: 'type("' + chunk.map((c) => c.type).filter((v, i, a) => a.indexOf(v) === i).join('","') + '")',
+        entitySelector: 'type("' + uniqueTypes.join('","') + '")',
         pageSize: chunkSize,
       });
       for (const ent of body.entities || []) {
@@ -174,7 +179,13 @@ async function getEntities(cfg, ids = []) {
         }
       }
     } catch (e) {
-      // ignore - fall back to whatever was embedded in the problem payload
+      // Log instead of swallow: we still fall back to embedded payload, but
+      // Dynatrace now sees the failure with trace_id/span_id correlation.
+      log.warn('dynatrace.getEntities.chunk_failed', {
+        chunk_index: Math.floor(i / chunkSize),
+        chunk_size: chunk.length,
+        entity_types: uniqueTypes,
+      }, e);
     }
   }
   return out;
