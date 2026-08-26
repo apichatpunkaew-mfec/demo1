@@ -98,7 +98,10 @@ const shutdown = () => {
   sdk
     .shutdown()
     .then(() => console.log('[tracing] SDK shut down'))
-    .catch((e) => console.error('[tracing] shutdown error:', e.message))
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn('[tracing] SDK shutdown error (ignored):', err.message);
+    })
     .finally(() => process.exit(0));
 };
 process.on('SIGTERM', shutdown);

@@ -22,6 +22,83 @@ const problemAnalysis = require('./problemAnalysis');
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 16, scheduling: 'lifo' });
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 16 });
 
+/**
+ * Latency targets and deprecation policy.
+ * Populated from a one-off Dynatrace live-trace analysis (24h, waa41263.live.dynatrace.com):
+ *   glm-5.2          19 calls   33.9s avg / 45s p95  -> slow
+ *   minimax-m3       21 calls   12.8s avg / 15.5s p95
+ *   claude-sonnet-5  39 calls    8.0s avg / 11.2s p95 -> production main
+ *   gemini-2.5-flash 19 calls    7.1s avg /  9.6s p95 -> fastest
+ * `perplexity` (74ms) is excluded because traces show zero token usage — likely mock.
+ */
+const MODEL_LATENCY_TARGETS = {
+  'glm-5.2':          { maxMs: 40000, deprecate: true,  fallback: 'claude-sonnet-5' },
+  'minimax-m3':       { maxMs: 20000, deprecate: false, fallback: 'claude-sonnet-5' },
+  'claude-sonnet-5':  { maxMs: 15000, deprecate: false, fallback: 'gemini-2.5-flash' },
+  'gemini-2.5-flash': { maxMs: 12000, deprecate: false, fallback: 'claude-sonnet-5' },
+};
+
+function pickFasterModel(requested, { allowDeprecation = true } = {}) {
+  const target = MODEL_LATENCY_TARGETS[requested];
+  if (target && target.deprecate && allowDeprecation && target.fallback) {
+    log.warn('model.deprecated_routed', { from: requested, to: target.fallback });
+    return target.fallback;
+  }
+  return requested;
+}
+
+/**
+ * Ring buffer of recent model-call metrics (per-model).
+ * Exposed via getMetrics() so /api/admin/latency can return them without querying Dynatrace.
+ */
+const METRICS_WINDOW = 200; // last N calls per model
+const modelMetrics = new Map(); // model -> { samples: number[] (ms), errors: number, timeouts: number }
+
+function recordMetric(model, durationMs, errorCode) {
+  if (!modelMetrics.has(model)) {
+    modelMetrics.set(model, { samples: [], errors: 0, timeouts: 0 });
+  }
+  const m = modelMetrics.get(model);
+  m.samples.push(durationMs);
+  if (m.samples.length > METRICS_WINDOW) m.samples.shift();
+  if (errorCode) {
+    m.errors += 1;
+    if (errorCode === 'AI_TIMEOUT') m.timeouts += 1;
+  }
+}
+
+function percentile(arr, p) {
+  if (!arr.length) return 0;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  return sorted[idx];
+}
+
+function summarize(samples) {
+  if (!samples.length) return { count: 0, avg_ms: 0, p50_ms: 0, p95_ms: 0, max_ms: 0 };
+  const sum = samples.reduce((a, b) => a + b, 0);
+  return {
+    count: samples.length,
+    avg_ms: Math.round(sum / samples.length),
+    p50_ms: Math.round(percentile(samples, 50)),
+    p95_ms: Math.round(percentile(samples, 95)),
+    max_ms: Math.round(Math.max(...samples)),
+  };
+}
+
+function getMetrics() {
+  const out = {};
+  for (const [model, m] of modelMetrics.entries()) {
+    out[model] = {
+      ...summarize(m.samples),
+      errors: m.errors,
+      timeouts: m.timeouts,
+      latency_target: MODEL_LATENCY_TARGETS[model] || null,
+    };
+  }
+  return out;
+}
+
 async function listModels(cfg) {
   if (!cfg.baseUrl) {
     log.error('ai.config.missing', { field: 'AI_BASE_URL' });
@@ -106,8 +183,15 @@ async function chatCompletion(cfg, messages, options = {}) {
       cfg.baseUrl.endsWith('/') ? cfg.baseUrl : cfg.baseUrl + '/'
     ).toString();
 
+    const startMs = Date.now();
+    const requestedModel = cfg.model;
+    const effectiveModel = pickFasterModel(requestedModel);
+    span.setAttribute('ai.model.requested', requestedModel);
+    span.setAttribute('ai.model.effective', effectiveModel);
+    span.setAttribute('ai.routed', requestedModel !== effectiveModel);
+
     const body = {
-      model: cfg.model,
+      model: effectiveModel,
       messages,
       temperature: options.temperature ?? 0.3,
     };
@@ -115,7 +199,19 @@ async function chatCompletion(cfg, messages, options = {}) {
     if (options.json) body.response_format = { type: 'json_object' };
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), options.timeoutMs || DEFAULT_TIMEOUT_MS);
+    const effectiveTimeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      // Mark the active span as a timeout error so Dynatrace dashboards can filter it.
+      const err = new Error(`AI chat exceeded ${effectiveTimeoutMs}ms`);
+      err.code = 'AI_TIMEOUT';
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: 'ai.timeout' });
+      span.setAttribute('error.type', 'ai.timeout');
+      span.setAttribute('error.timeout_ms', effectiveTimeoutMs);
+    }, effectiveTimeoutMs);
 
     try {
       const res = await fetch(url, {
@@ -151,7 +247,19 @@ async function chatCompletion(cfg, messages, options = {}) {
         span.setAttribute('ai.usage.completion_tokens', parsed.usage.completion_tokens || 0);
         span.setAttribute('ai.usage.total_tokens', parsed.usage.total_tokens || 0);
       }
+      recordMetric(effectiveModel, Date.now() - startMs, null);
       return parsed;
+    } catch (err) {
+      // Surface AbortError due to our own timeout as a clear AI_TIMEOUT so callers / Dynatrace
+      // can distinguish gateway timeouts from client cancellations.
+      if (timedOut || (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR'))) {
+        err.code = 'AI_TIMEOUT';
+        err.timeoutMs = effectiveTimeoutMs;
+        span.setAttribute('error.type', 'ai.timeout');
+        span.setStatus({ code: SpanStatusCode.ERROR, message: 'ai.timeout' });
+      }
+      recordMetric(effectiveModel, Date.now() - startMs, err.code || (err.status ? `http.${err.status}` : 'unknown'));
+      throw err;
     } finally {
       clearTimeout(timer);
       span.end();
@@ -187,4 +295,7 @@ module.exports = {
   chatCompletion,
   listModels,
   analyzeProblem,
+  getMetrics,
+  pickFasterModel,
+  MODEL_LATENCY_TARGETS,
 };

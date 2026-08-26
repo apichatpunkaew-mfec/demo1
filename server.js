@@ -160,6 +160,23 @@ app.get('/api/models', asyncHandler(async (_req, res) => {
   res.json(data);
 }));
 
+// Admin: per-model in-memory latency snapshot (rolling window).
+// Populated by services/ai.js from each ai.chat span. Useful when Dynatrace
+// is unavailable or for quick health checks; for full fidelity query Dynatrace.
+app.get('/api/admin/latency', asyncHandler(async (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    service: 'dynatrace-ai-dashboard',
+    uptime_s: Math.round(process.uptime()),
+    concurrency: ANALYZE_CONCURRENCY,
+    page_size: DEFAULT_PROBLEM_PAGE_SIZE,
+    ai_model_configured: aiCfg.model,
+    latency_targets: ai.MODEL_LATENCY_TARGETS,
+    models: ai.getMetrics(),
+    timestamp: new Date().toISOString(),
+  });
+}));
+
 // AI: analyze a problem payload supplied in the request body
 app.post('/api/analyze', asyncHandler(async (req, res) => {
   const problem = req.body && req.body.problem;
