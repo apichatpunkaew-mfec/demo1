@@ -207,6 +207,43 @@ dynatrace.fetch api/v2/...   1  -          669ms    (one outbound per 10s window
 
 ---
 
+## Error handling & observability
+
+Async route handlers run inside `asyncHandler` which catches rejections and forwards them to the Express error middleware **without crashing the process**:
+
+| Failure mode | Before | After |
+|---|---|---|
+| Async throw from upstream (e.g. `fetch failed`) | process exit, no response | `HTTP 500` + structured log |
+| `unhandledRejection` | process exit | caught, logged, process keeps serving |
+| Spans marked on error | not marked | `span.recordException(err)` + `span.setStatus({ code: ERROR, message })` |
+| Logs | plain `console.error` only | mirror to **stdout JSON** + **OTel Logs API** (severity 5/9/13/17, `trace_id`, `span_id`) |
+
+### Verified against live Dynatrace (`waa41263.apps.dynatrace.com`)
+
+Two error traces (`e1c382e3d5cc6d9f8870a1789ce12182`, `5bcf525da866639b7916f915e5599468`) ingested end-to-end:
+
+```
+service.name    : dynatrace-ai-dashboard-test
+dt.entity.service: SERVICE-083B248710036AFA
+span.name       : cache.listModels
+span.status_code: error
+span.status_message: fetch failed
+span.events[0].exception.type  : TypeError
+span.events[0].exception.message: fetch failed
+span.events[0].exception.stack_trace: full undici stack
+```
+
+DQL to verify locally:
+
+```dql
+fetch spans, from: now() - 1h
+| filter service.name == "dynatrace-ai-dashboard-test"
+       and span.name == "cache.listModels"
+| fields span.name, span.status_code, span.status_message, trace.id, span.events
+```
+
+---
+
 ## OpenTelemetry tracing
 
 `tracing.js` boots an OTel SDK with the auto-instrumentations + Dynatrace OTLP exporter (protobuf):
