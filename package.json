@@ -6,7 +6,11 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "lint": "eslint server.js services/ tracing.js",
+    "lint:fix": "eslint server.js services/ tracing.js --fix",
+    "security:scan": "eslint --no-eslintrc --config eslint.config.js server.js services/ tracing.js",
+    "test:security": "node --test tests/security.test.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -19,8 +23,15 @@
     "@opentelemetry/sdk-node": "^0.221.0",
     "@opentelemetry/semantic-conventions": "^1.43.0",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.7.0",
+    "helmet": "^8.3.0"
   },
   "author": "",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "eslint": "^9.39.5",
+    "eslint-plugin-security": "^4.0.1",
+    "gitleaks": "^1.0.0"
+  }
 }

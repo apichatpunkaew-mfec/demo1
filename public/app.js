@@ -38,7 +38,12 @@ let busy = false;
 // Chat state — persistent across the page session, cleared by "Clear" or
 // by attaching a different problem.
 const chatState = {
-  sessionId: 'sess-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36),
+  // SECURITY: Use crypto.randomUUID() (browser native, available in all modern browsers).
+  // Math.random() is predictable and could allow an attacker on the same network
+  // to guess the sessionId and hijack the chat history.
+  sessionId: (crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'sess-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36),
   open: false,
   streaming: false,
   attachedProblem: null,   // { problemId, title } | null

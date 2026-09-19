@@ -22,6 +22,8 @@ require('./tracing');
 
 const path = require('path');
 const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
 const dynatrace = require('./services/dynatrace');
 const ai = require('./services/ai');
@@ -50,7 +52,35 @@ const aiCfg = {
 };
 
 const app = express();
+
+// SECURITY: helmet sets sensible HTTP headers (HSTS, X-Content-Type-Options,
+// X-Frame-Options, Referrer-Policy, etc.) to harden against common web attacks.
+// CSP is left off because the static UI uses inline styles.
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// SECURITY: Bound request size at the parser level (defense in depth —
+// readMessage() also caps chat messages at 32 KiB).
 app.use(express.json({ limit: '1mb' }));
+
+// SECURITY: Per-IP rate limiter for AI endpoints. Each chat call hits the
+// LiteLLM gateway ($$$) so we cap to prevent cost spikes + DoS.
+//   chat endpoints: 30 req / min / IP
+//   analyze endpoints: 20 req / min / IP
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many chat requests, slow down.' },
+});
+const analyzeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many analyze requests, slow down.' },
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 /* ----------------------------- helpers ----------------------------- */
@@ -122,6 +152,42 @@ async function mapWithConcurrency(items, limit, mapper) {
 
 /* ------------------------------ API ------------------------------- */
 
+// SECURITY: Input validation helpers for /api/chat/* endpoints.
+// Without these, an attacker can DoS the in-memory session Map by sending
+// huge payloads or unbounded sessionIds.
+function readSessionId(req, res) {
+  const sid = req.body && req.body.sessionId;
+  if (!sid || typeof sid !== 'string') {
+    res.status(400).json({ error: 'sessionId required' });
+    return null;
+  }
+  // Cap length to prevent unbounded Map keys + JSON overhead.
+  if (sid.length > 128) {
+    res.status(400).json({ error: 'sessionId too long (max 128 chars)' });
+    return null;
+  }
+  // UUID v4 shape OR 'sess-' prefix (for backward compat with old clients).
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sid)) {
+    res.status(400).json({ error: 'sessionId has invalid characters' });
+    return null;
+  }
+  return sid;
+}
+
+function readMessage(req, res) {
+  const msg = req.body && req.body.message;
+  if (!msg || typeof msg !== 'string' || !msg.trim()) {
+    res.status(400).json({ error: 'message required' });
+    return null;
+  }
+  // 32 KiB cap — well above any reasonable prompt but blocks obvious DoS.
+  if (msg.length > 32 * 1024) {
+    res.status(400).json({ error: 'message too long (max 32 KiB)' });
+    return null;
+  }
+  return msg;
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
@@ -179,7 +245,7 @@ app.get('/api/admin/latency', asyncHandler(async (_req, res) => {
 }));
 
 // AI: analyze a problem payload supplied in the request body
-app.post('/api/analyze', asyncHandler(async (req, res) => {
+app.post('/api/analyze', analyzeLimiter, asyncHandler(async (req, res) => {
   const problem = req.body && req.body.problem;
   if (!problem || typeof problem !== 'object') {
     return res.status(400).json({ error: 'Body must include { problem: {...} }' });
@@ -196,7 +262,7 @@ app.post('/api/analyze', asyncHandler(async (req, res) => {
 }));
 
 // AI: fetch + analyze a single problem by id
-app.get('/api/analyze/:problemId', asyncHandler(async (req, res) => {
+app.get('/api/analyze/:problemId', analyzeLimiter, asyncHandler(async (req, res) => {
   const problem = await dynatrace.getProblem(dtCfg, req.params.problemId);
   const override = req.query.model || '';
   const cfg = override ? { ...aiCfg, model: override } : aiCfg;
@@ -206,7 +272,7 @@ app.get('/api/analyze/:problemId', asyncHandler(async (req, res) => {
   res.json({ problem, analysis: result });
 }));
 // AI: batch analyze (default: OPEN problems, first N). Parallel, bounded concurrency.
-app.post('/api/analyze-all', asyncHandler(async (req, res) => {
+app.post('/api/analyze-all', analyzeLimiter, asyncHandler(async (req, res) => {
   const body = req.body || {};
   const limit = Math.min(parseInt(body.limit != null ? body.limit : '5', 10), 25);
   const status = body.status || 'OPEN';
@@ -236,13 +302,15 @@ app.post('/api/analyze-all', asyncHandler(async (req, res) => {
  * same session answer questions about that specific incident.
  * Body: { sessionId, problemId }
  */
-app.post('/api/chat/attach-problem', asyncHandler(async (req, res) => {
-  const { sessionId, problemId } = req.body || {};
-  if (!sessionId || typeof sessionId !== 'string') {
-    return res.status(400).json({ error: 'sessionId required' });
-  }
-  if (!problemId) {
+app.post('/api/chat/attach-problem', chatLimiter, asyncHandler(async (req, res) => {
+  const sessionId = readSessionId(req, res);
+  if (sessionId === null) return;
+  const { problemId } = req.body || {};
+  if (!problemId || typeof problemId !== 'string') {
     return res.status(400).json({ error: 'problemId required' });
+  }
+  if (problemId.length > 128) {
+    return res.status(400).json({ error: 'problemId too long (max 128 chars)' });
   }
   const problem = await dynatrace.getProblem(dtCfg, problemId);
   chat.setProblemContext(sessionId, problem);
@@ -252,9 +320,9 @@ app.post('/api/chat/attach-problem', asyncHandler(async (req, res) => {
 /**
  * Detach the current problem context (start a fresh conversation).
  */
-app.post('/api/chat/clear', asyncHandler(async (req, res) => {
-  const { sessionId } = req.body || {};
-  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+app.post('/api/chat/clear', chatLimiter, asyncHandler(async (req, res) => {
+  const sessionId = readSessionId(req, res);
+  if (sessionId === null) return;
   chat.clear(sessionId);
   res.json({ sessionId, cleared: true });
 }));
@@ -263,12 +331,12 @@ app.post('/api/chat/clear', asyncHandler(async (req, res) => {
  * Send a chat message, get the full reply (non-streaming).
  * Body: { sessionId, message, model?, temperature?, maxTokens? }
  */
-app.post('/api/chat', asyncHandler(async (req, res) => {
-  const { sessionId, message, model, temperature, maxTokens } = req.body || {};
-  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
-  if (!message || typeof message !== 'string' || !message.trim()) {
-    return res.status(400).json({ error: 'message required' });
-  }
+app.post('/api/chat', chatLimiter, asyncHandler(async (req, res) => {
+  const sessionId = readSessionId(req, res);
+  if (sessionId === null) return;
+  const message = readMessage(req, res);
+  if (message === null) return;
+  const { model, temperature, maxTokens } = req.body || {};
 
   const cfg = model ? { ...aiCfg, model } : aiCfg;
   const messages = chat.buildMessages(sessionId, message.trim());
@@ -298,12 +366,12 @@ app.post('/api/chat', asyncHandler(async (req, res) => {
  *   event: done     data: {"reply":"...","model":"...","usage":{...}}
  *   event: error    data: {"error":"..."}
  */
-app.post('/api/chat/stream', asyncHandler(async (req, res) => {
-  const { sessionId, message, model, temperature, maxTokens } = req.body || {};
-  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
-  if (!message || typeof message !== 'string' || !message.trim()) {
-    return res.status(400).json({ error: 'message required' });
-  }
+app.post('/api/chat/stream', chatLimiter, asyncHandler(async (req, res) => {
+  const sessionId = readSessionId(req, res);
+  if (sessionId === null) return;
+  const message = readMessage(req, res);
+  if (message === null) return;
+  const { model, temperature, maxTokens } = req.body || {};
 
   // SSE headers
   res.status(200);
