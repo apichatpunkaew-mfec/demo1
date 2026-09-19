@@ -86,8 +86,38 @@
         <button class="close" id="modal-close" aria-label="Close">&times;</button>
       </header>
       <div class="modal-body" id="modal-body">Loading&hellip;</div>
+      <footer class="modal-footer" id="modal-footer">
+        <button class="btn" id="btn-ask-ai" data-default-label="🤖 Ask AI about this">🤖 Ask AI about this</button>
+      </footer>
     </div>
   </div>
+
+  <!-- Chat panel -->
+  <button class="chat-fab hidden" id="chat-fab" aria-label="Open chat" type="button">
+    <span aria-hidden="true">💬</span>
+    <span class="chat-badge hidden" id="chat-badge"></span>
+  </button>
+
+  <aside class="chat-panel hidden" id="chat-panel" role="dialog" aria-label="AI chat">
+    <header class="chat-header">
+      <div class="chat-title">
+        <span class="dot"></span>
+        <span>AI Assistant</span>
+        <span class="chat-context muted" id="chat-context"></span>
+      </div>
+      <div class="chat-actions">
+        <button class="btn small" id="chat-clear" title="Clear conversation">Clear</button>
+        <button class="btn small" id="chat-close" aria-label="Close chat">&times;</button>
+      </div>
+    </header>
+    <div class="chat-log" id="chat-log">
+      <div class="chat-empty muted">Ask anything about Dynatrace problems or paste a problem from the table to discuss it.</div>
+    </div>
+    <form class="chat-input" id="chat-form" autocomplete="off">
+      <textarea id="chat-text" placeholder="Type a message&hellip; (Shift+Enter for newline, Enter to send)" rows="1"></textarea>
+      <button class="btn primary" id="chat-send" type="submit">Send</button>
+    </form>
+  </aside>
 
   <script src="/app.js" type="module"></script>
 </body>

@@ -25,6 +25,7 @@ const express = require('express');
 
 const dynatrace = require('./services/dynatrace');
 const ai = require('./services/ai');
+const chat = require('./services/chat');
 const log = require('./services/logger');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -227,6 +228,151 @@ app.post('/api/analyze-all', asyncHandler(async (req, res) => {
 
   res.json({ count: results.length, results });
 }));
+
+/* ---------------------------- chat with bot ---------------------- */
+
+/**
+ * Bind a session to a Dynatrace problem so subsequent /api/chat calls in the
+ * same session answer questions about that specific incident.
+ * Body: { sessionId, problemId }
+ */
+app.post('/api/chat/attach-problem', asyncHandler(async (req, res) => {
+  const { sessionId, problemId } = req.body || {};
+  if (!sessionId || typeof sessionId !== 'string') {
+    return res.status(400).json({ error: 'sessionId required' });
+  }
+  if (!problemId) {
+    return res.status(400).json({ error: 'problemId required' });
+  }
+  const problem = await dynatrace.getProblem(dtCfg, problemId);
+  chat.setProblemContext(sessionId, problem);
+  res.json({ sessionId, problemId: problem.problemId || problemId, title: problem.title });
+}));
+
+/**
+ * Detach the current problem context (start a fresh conversation).
+ */
+app.post('/api/chat/clear', asyncHandler(async (req, res) => {
+  const { sessionId } = req.body || {};
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+  chat.clear(sessionId);
+  res.json({ sessionId, cleared: true });
+}));
+
+/**
+ * Send a chat message, get the full reply (non-streaming).
+ * Body: { sessionId, message, model?, temperature?, maxTokens? }
+ */
+app.post('/api/chat', asyncHandler(async (req, res) => {
+  const { sessionId, message, model, temperature, maxTokens } = req.body || {};
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+  if (!message || typeof message !== 'string' || !message.trim()) {
+    return res.status(400).json({ error: 'message required' });
+  }
+
+  const cfg = model ? { ...aiCfg, model } : aiCfg;
+  const messages = chat.buildMessages(sessionId, message.trim());
+  const startMs = Date.now();
+  const reply = await ai.chatCompletion(cfg, messages, {
+    json: false,
+    temperature: typeof temperature === 'number' ? temperature : 0.5,
+    maxTokens,
+    timeoutMs: 60000,
+  });
+  const content = (reply.choices && reply.choices[0] && reply.choices[0].message && reply.choices[0].message.content) || '';
+  chat.recordTurn(sessionId, message.trim(), content);
+  res.json({
+    sessionId,
+    model: reply.model,
+    reply: content,
+    usage: reply.usage || null,
+    duration_ms: Date.now() - startMs,
+  });
+}));
+
+/**
+ * Streaming chat via Server-Sent Events.
+ * Body: { sessionId, message, model?, temperature?, maxTokens? }
+ * SSE events:
+ *   event: chunk    data: {"delta":"..."}
+ *   event: done     data: {"reply":"...","model":"...","usage":{...}}
+ *   event: error    data: {"error":"..."}
+ */
+app.post('/api/chat/stream', asyncHandler(async (req, res) => {
+  const { sessionId, message, model, temperature, maxTokens } = req.body || {};
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+  if (!message || typeof message !== 'string' || !message.trim()) {
+    return res.status(400).json({ error: 'message required' });
+  }
+
+  // SSE headers
+  res.status(200);
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no', // disable proxy buffering
+  });
+  res.flushHeaders && res.flushHeaders();
+
+  // Send a comment immediately so the browser's EventSource fires onopen
+  res.write(`: chat stream open\n\n`);
+
+  const cfg = model ? { ...aiCfg, model } : aiCfg;
+  let messages;
+  try {
+    messages = chat.buildMessages(sessionId, message.trim());
+  } catch (e) {
+    res.write(`event: error\ndata: ${JSON.stringify({ error: e.message })}\n\n`);
+    res.end();
+    return;
+  }
+
+  // Abort if the client disconnects mid-stream.
+  let aborted = false;
+  req.on('close', () => { aborted = true; });
+
+  try {
+    const iterator = await ai.streamChatCompletion(cfg, messages, {
+      temperature: typeof temperature === 'number' ? temperature : 0.5,
+      maxTokens,
+      timeoutMs: 90000,
+    });
+
+    let full = '';
+    for await (const delta of iterator) {
+      if (aborted) break;
+      full += delta;
+      res.write(`event: chunk\ndata: ${JSON.stringify({ delta })}\n\n`);
+    }
+    if (!aborted) {
+      chat.recordTurn(sessionId, message.trim(), full);
+      res.write(`event: done\ndata: ${JSON.stringify({
+        sessionId,
+        reply: full,
+        model: iterator.model,
+      })}\n\n`);
+    }
+  } catch (e) {
+    if (!aborted) {
+      res.write(`event: error\ndata: ${JSON.stringify({
+        error: e.message,
+        code: e.code || null,
+        status: e.status || null,
+      })}\n\n`);
+    }
+  } finally {
+    if (!aborted) res.end();
+  }
+}));
+
+/**
+ * Inspect chat session stats (for /api/admin/latency-style debugging).
+ */
+app.get('/api/admin/chat', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json(chat.getStats());
+});
 
 /* ---------------------------- 404 + errors ----------------------- */
 

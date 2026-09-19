@@ -81,6 +81,11 @@ All endpoints return JSON unless noted.
 | `POST` | `/api/analyze` | Body: `{ "problem": {...}, "model"?: "...", "summaryOnly"?: bool }`. Returns parsed analysis JSON. |
 | `GET`  | `/api/analyze/:problemId?model=...&summaryOnly=1` | Fetch the problem then analyze it. Returns `{ problem, analysis }`. |
 | `POST` | `/api/analyze-all` | Body: `{ "limit": 5, "status": "OPEN", "model"?: "..." }`. Sequential analysis loop. |
+| `POST` | `/api/chat/attach-problem` | Body: `{ sessionId, problemId }`. Binds a chat session to a Dynatrace problem. |
+| `POST` | `/api/chat/clear` | Body: `{ sessionId }`. Drops history + problem context. |
+| `POST` | `/api/chat` | Body: `{ sessionId, message, model?, temperature?, maxTokens? }`. Returns full reply (non-streaming). |
+| `POST` | `/api/chat/stream` | Same body. **SSE** stream of `chunk`/`done`/`error` events. |
+| `GET`  | `/api/admin/chat` | In-memory chat session stats. |
 
 `/api/analyze` expects the AI to return strict JSON shaped like:
 ```json
@@ -114,6 +119,52 @@ If the model wraps it in fences or returns prose, the server falls back to retur
 - **“🤖 Analyze”** button per row, plus **“Analyze all (open)”** to batch-process.
 
 You can switch the model at runtime in the top-right **Model** dropdown — values come from `GET /api/models`.
+
+---
+
+## Chat with the bot
+
+A floating 💬 button (bottom-right) opens a chat panel that streams
+responses from the same AI endpoint. Highlights:
+
+- **Streaming** via Server-Sent Events (`POST /api/chat/stream`) — tokens
+  appear as the model produces them.
+- **Problem context**: open any problem's details or analysis modal, then
+  click **🤖 Ask AI about this** at the bottom of the modal. The chat
+  session is bound to that problem; subsequent questions are answered
+  in its context (title, severity, affected entities, root cause, etc.).
+  Attaching a new problem resets history.
+- **Server-side history** keyed by `sessionId`, capped at 20 turns
+  (`MAX_MESSAGES = 40`) per session, expired after 1 hour of inactivity.
+- **Model override**: the chat uses the model selected in the top-right
+  dropdown; switching it mid-conversation takes effect on the next turn.
+- **Keyboard**: `Enter` sends, `Shift+Enter` adds a newline, `Esc` closes
+  the chat panel (the existing modal Esc handler is unaffected).
+- **Backend session manager**: `services/chat.js` exposes
+  `getStats()` via `GET /api/admin/chat` for quick inspection.
+
+Sample request:
+
+```bash
+curl -N -X POST http://localhost:3000/api/chat/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"sessionId":"demo","message":"What does this error usually mean?"}'
+```
+
+Sample SSE stream:
+
+```
+: chat stream open
+
+event: chunk
+data: {"delta":"This "}
+
+event: chunk
+data: {"delta":"usually "}
+
+event: done
+data: {"sessionId":"demo","reply":"...","model":"claude-sonnet-5"}
+```
 
 ---
 

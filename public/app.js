@@ -18,11 +18,31 @@ const els = {
   modalTitle:   $('#modal-title'),
   modalBody:    $('#modal-body'),
   modalClose:   $('#modal-close'),
+  askAi:        $('#btn-ask-ai'),
+  // Chat
+  chatFab:      $('#chat-fab'),
+  chatPanel:    $('#chat-panel'),
+  chatLog:      $('#chat-log'),
+  chatForm:     $('#chat-form'),
+  chatText:     $('#chat-text'),
+  chatSend:     $('#chat-send'),
+  chatClose:    $('#chat-close'),
+  chatClear:    $('#chat-clear'),
+  chatContext:  $('#chat-context'),
 };
 
 let currentProblems = [];
 let availableModels = [];
 let busy = false;
+
+// Chat state — persistent across the page session, cleared by "Clear" or
+// by attaching a different problem.
+const chatState = {
+  sessionId: 'sess-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36),
+  open: false,
+  streaming: false,
+  attachedProblem: null,   // { problemId, title } | null
+};
 
 /* ------------------------------ helpers --------------------------- */
 async function api(method, path, body) {
@@ -38,6 +58,23 @@ async function api(method, path, body) {
     throw new Error('HTTP ' + res.status + ': ' + msg);
   }
   return data;
+}
+
+/**
+ * Post JSON and return a Response (caller streams the body). Throws on non-2xx.
+ */
+async function apiPostStream(path, body) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.json()).error || ''; } catch { /* ignore */ }
+    throw new Error('HTTP ' + res.status + ': ' + (detail || res.statusText));
+  }
+  return res;
 }
 
 function fmtTime(ms) {
@@ -213,6 +250,8 @@ async function showProblemDetails(problemId) {
   openModal();
   els.modalTitle.textContent = 'Problem ' + problemId;
   els.modalBody.innerHTML = '<p><span class="spinner"></span>Loading details&hellip;</p>';
+  els.modalBody.dataset.currentProblemId = problemId;
+  els.modalBody.dataset.currentProblemTitle = problemId;
   try {
     const data = await api('GET', '/api/problems/' + encodeURIComponent(problemId));
     const affected = (data.affectedEntities || []).map(entityChip).join(' ');
@@ -227,6 +266,7 @@ async function showProblemDetails(problemId) {
       : '<span class="muted">none identified</span>';
     els.modalBody.innerHTML =
       '<h3>' + escapeHtml(data.title || '') + '</h3>' +
+      '<p class="muted" style="margin-top:-6px">problemId: ' + escapeHtml(problemId) + '</p>';
       '<p>' +
         '<span class="badge sev-' + escapeHtml(data.severityLevel) + '">' + escapeHtml(data.severityLevel) + '</span>' +
         ' <span class="badge st-' + escapeHtml(data.status) + '">' + escapeHtml(data.status) + '</span>' +
@@ -247,11 +287,16 @@ async function analyzeProblem(problemId) {
   openModal();
   els.modalTitle.textContent = 'AI analysis — ' + problemId;
   els.modalBody.innerHTML = '<p><span class="spinner"></span>Analyzing with AI&hellip;</p>';
+  els.modalBody.dataset.currentProblemId = problemId;
+  els.modalBody.dataset.currentProblemTitle = problemId;
   try {
     const model = els.modelSelect.value || '';
     const url = '/api/analyze/' + encodeURIComponent(problemId) + (model ? '?model=' + encodeURIComponent(model) : '');
     const result = await api('GET', url);
     els.modalBody.innerHTML = renderAnalysis(result.problem, result.analysis);
+    if (result.problem && result.problem.title) {
+      els.modalBody.dataset.currentProblemTitle = result.problem.title;
+    }
   } catch (e) {
     els.modalBody.innerHTML = '<p class="err">Analysis failed: ' + escapeHtml(e.message) + '</p>';
   }
@@ -288,6 +333,179 @@ async function analyzeAllOpen() {
   }
 }
 
+/* ------------------------------ chat ------------------------------ */
+function renderChatEmpty() {
+  els.chatLog.innerHTML = '<div class="chat-empty muted">Ask anything about Dynatrace problems or paste a problem from the table to discuss it.</div>';
+}
+
+function scrollChatToBottom() {
+  els.chatLog.scrollTop = els.chatLog.scrollHeight;
+}
+
+function appendChatMessage(role, content, opts = {}) {
+  // Remove the empty hint if it's still there.
+  const empty = els.chatLog.querySelector('.chat-empty');
+  if (empty) empty.remove();
+
+  const div = document.createElement('div');
+  div.className = 'chat-msg ' + role + (opts.streaming ? ' streaming' : '');
+  if (role !== 'system') {
+    const roleLabel = document.createElement('span');
+    roleLabel.className = 'role';
+    roleLabel.textContent = opts.roleLabel || (role === 'user' ? 'You' : 'AI');
+    div.appendChild(roleLabel);
+  }
+  const text = document.createElement('span');
+  text.className = 'text';
+  text.textContent = content;
+  div.appendChild(text);
+  if (opts.id) div.dataset.msgId = opts.id;
+  els.chatLog.appendChild(div);
+  scrollChatToBottom();
+  return div;
+}
+
+function updateChatMessage(id, content, streaming) {
+  const div = els.chatLog.querySelector('[data-msg-id="' + id + '"]');
+  if (!div) return;
+  const text = div.querySelector('.text');
+  if (text) text.textContent = content;
+  div.classList.toggle('streaming', !!streaming);
+  scrollChatToBottom();
+}
+
+function setChatBusy(b) {
+  chatState.streaming = b;
+  els.chatSend.disabled = b;
+  els.chatSend.textContent = b ? '…' : 'Send';
+  els.chatClear.disabled = b;
+}
+
+function updateChatContext() {
+  if (chatState.attachedProblem) {
+    els.chatContext.textContent = '· ' + chatState.attachedProblem.title + ' (' + chatState.attachedProblem.problemId + ')';
+    els.chatContext.title = chatState.attachedProblem.title;
+  } else {
+    els.chatContext.textContent = '';
+    els.chatContext.title = '';
+  }
+}
+
+function openChat() {
+  if (chatState.open) return;
+  chatState.open = true;
+  els.chatPanel.classList.remove('hidden');
+  els.chatFab.classList.add('hidden');
+  els.chatText.focus();
+}
+
+function closeChat() {
+  chatState.open = false;
+  els.chatPanel.classList.add('hidden');
+  els.chatFab.classList.remove('hidden');
+}
+
+async function attachProblemToChat(problemId, problemTitle) {
+  try {
+    await api('POST', '/api/chat/attach-problem', {
+      sessionId: chatState.sessionId,
+      problemId,
+    });
+    chatState.attachedProblem = { problemId, title: problemTitle || problemId };
+    updateChatContext();
+    renderChatEmpty();
+    appendChatMessage('system', '📎 Now discussing: ' + chatState.attachedProblem.title);
+    openChat();
+  } catch (e) {
+    appendChatMessage('error', 'Could not attach problem: ' + e.message);
+  }
+}
+
+async function clearChat() {
+  if (chatState.streaming) return;
+  try {
+    await api('POST', '/api/chat/clear', { sessionId: chatState.sessionId });
+  } catch { /* ignore — local clear still works */ }
+  chatState.attachedProblem = null;
+  updateChatContext();
+  renderChatEmpty();
+}
+
+/**
+ * Auto-grow the textarea up to its CSS max-height.
+ */
+function autoresizeTextarea() {
+  const ta = els.chatText;
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 140) + 'px';
+}
+
+async function sendChatMessage(text) {
+  if (!text || !text.trim()) return;
+  if (chatState.streaming) return;
+
+  setChatBusy(true);
+  appendChatMessage('user', text.trim());
+
+  const botId = 'bot-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+  appendChatMessage('bot', '', { id: botId, streaming: true, roleLabel: 'AI' });
+
+  let acc = '';
+  try {
+    const res = await apiPostStream('/api/chat/stream', {
+      sessionId: chatState.sessionId,
+      message: text.trim(),
+      model: els.modelSelect.value || undefined,
+    });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buf = '';
+    let sawError = null;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // Parse SSE events (blank-line delimited).
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const raw = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        let eventName = 'message';
+        const dataLines = [];
+        for (const line of raw.split('\n')) {
+          if (line.startsWith('event:')) eventName = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+        }
+        const payload = dataLines.join('\n');
+        if (!payload) continue;
+        try {
+          const json = JSON.parse(payload);
+          if (eventName === 'chunk' && json.delta) {
+            acc += json.delta;
+            updateChatMessage(botId, acc, true);
+          } else if (eventName === 'done') {
+            if (json.reply) acc = json.reply;
+          } else if (eventName === 'error') {
+            sawError = json.error || 'unknown error';
+          }
+        } catch { /* ignore malformed */ }
+      }
+    }
+    if (sawError) {
+      updateChatMessage(botId, '⚠️ ' + sawError, false);
+      const div = els.chatLog.querySelector('[data-msg-id="' + botId + '"]');
+      if (div) div.classList.remove('streaming');
+    } else {
+      updateChatMessage(botId, acc, false);
+    }
+  } catch (e) {
+    updateChatMessage(botId, '⚠️ ' + e.message, false);
+  } finally {
+    setChatBusy(false);
+    els.chatText.focus();
+  }
+}
+
 /* ------------------------------ events ---------------------------- */
 els.refresh.addEventListener('click', () => loadProblems());
 els.analyzeAll.addEventListener('click', () => analyzeAllOpen());
@@ -308,6 +526,44 @@ els.tbody.addEventListener('click', (e) => {
   if (btn.dataset.action === 'details') showProblemDetails(id);
   if (btn.dataset.action === 'analyze') analyzeProblem(id);
 });
+
+/* ---- chat wiring ---- */
+els.chatFab.addEventListener('click', openChat);
+els.chatClose.addEventListener('click', closeChat);
+els.chatClear.addEventListener('click', clearChat);
+
+els.chatForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = els.chatText.value;
+  els.chatText.value = '';
+  autoresizeTextarea();
+  sendChatMessage(text);
+});
+
+els.chatText.addEventListener('input', autoresizeTextarea);
+els.chatText.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    els.chatForm.requestSubmit();
+  }
+});
+
+els.askAi.addEventListener('click', () => {
+  // Find the most recently rendered problem in the modal-body (carried via
+  // data attributes set by the analysis/details renderers) OR fall back to
+  // a small inline input dialog for the problem id.
+  const id = els.modalBody.dataset.currentProblemId;
+  const title = els.modalBody.dataset.currentProblemTitle || id;
+  if (!id) {
+    appendChatMessage('error', 'Open a problem details/analysis modal first, then click "Ask AI".');
+    openChat();
+    return;
+  }
+  attachProblemToChat(id, title);
+});
+
+// Show the floating chat button once everything else is ready.
+els.chatFab.classList.remove('hidden');
 
 /* ------------------------------ boot ------------------------------ */
 (async function init() {

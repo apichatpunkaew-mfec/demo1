@@ -268,6 +268,151 @@ async function chatCompletion(cfg, messages, options = {}) {
 }
 
 /**
+ * Streaming chat completion. Yields SSE-style text chunks from the LLM as
+ * they arrive. Returns the full assembled text plus usage (if reported in
+ * the final chunk).
+ *
+ * Note: streaming responses bypass the strict-JSON contract used by
+ * analyzeProblem() — the caller (chat.js / server.js) just accumulates text.
+ */
+async function streamChatCompletion(cfg, messages, options = {}) {
+  return tracer.startActiveSpan('ai.chat.stream', async (span) => {
+    if (!cfg.baseUrl) { span.end(); throw new Error('AI_BASE_URL is not configured'); }
+    if (!cfg.apiKey) { span.end(); throw new Error('AI_API_KEY is not configured'); }
+    if (!cfg.model)  { span.end(); throw new Error('AI_MODEL is not configured'); }
+
+    span.setAttribute('ai.model', cfg.model);
+    span.setAttribute('ai.temperature', options.temperature ?? 0.5);
+    if (options.maxTokens) span.setAttribute('ai.max_tokens', options.maxTokens);
+    span.setAttribute('ai.message_count', messages.length);
+
+    const url = new URL(
+      'v1/chat/completions',
+      cfg.baseUrl.endsWith('/') ? cfg.baseUrl : cfg.baseUrl + '/'
+    ).toString();
+
+    const startMs = Date.now();
+    const requestedModel = cfg.model;
+    const effectiveModel = pickFasterModel(requestedModel);
+    span.setAttribute('ai.model.requested', requestedModel);
+    span.setAttribute('ai.model.effective', effectiveModel);
+    span.setAttribute('ai.routed', requestedModel !== effectiveModel);
+
+    const body = {
+      model: effectiveModel,
+      messages,
+      temperature: options.temperature ?? 0.5,
+      stream: true,
+    };
+    if (options.maxTokens) body.max_tokens = options.maxTokens;
+
+    const controller = new AbortController();
+    const effectiveTimeoutMs = options.timeoutMs || 60000;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      const err = new Error(`AI chat stream exceeded ${effectiveTimeoutMs}ms`);
+      err.code = 'AI_TIMEOUT';
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: 'ai.timeout' });
+    }, effectiveTimeoutMs);
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        agent: url.startsWith('https') ? httpsAgent : httpAgent,
+        headers: {
+          Authorization: `Bearer ${cfg.apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      span.setAttribute('http.status_code', res.status);
+
+      if (!res.ok) {
+        const text = await res.text();
+        const err = new Error(
+          'AI chat stream ' + res.status + ': ' + text.slice(0, 500)
+        );
+        err.status = res.status;
+        err.body = text;
+        span.recordException(err);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+        throw err;
+      }
+
+      // Return an async iterator over SSE delta chunks.
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      let total = '';
+
+      async function* chunks() {
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            // SSE events are separated by a blank line.
+            let idx;
+            while ((idx = buffer.indexOf('\n\n')) !== -1) {
+              const event = buffer.slice(0, idx);
+              buffer = buffer.slice(idx + 2);
+              const lines = event.split('\n');
+              for (const line of lines) {
+                if (!line.startsWith('data:')) continue;
+                const payload = line.slice(5).trim();
+                if (!payload || payload === '[DONE]') continue;
+                try {
+                  const json = JSON.parse(payload);
+                  const delta = json.choices &&
+                    json.choices[0] &&
+                    json.choices[0].delta &&
+                    json.choices[0].delta.content;
+                  if (delta) {
+                    total += delta;
+                    yield delta;
+                  }
+                } catch {
+                  // ignore malformed chunk — keep streaming
+                }
+              }
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      }
+
+      const iterator = chunks();
+      // Wrap so caller can still read .text after iteration
+      iterator.text = () => total;
+      iterator.model = effectiveModel;
+      recordMetric(effectiveModel, Date.now() - startMs, null);
+      span.setStatus({ code: SpanStatusCode.OK });
+      return iterator;
+    } catch (err) {
+      if (timedOut || (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR'))) {
+        err.code = 'AI_TIMEOUT';
+        err.timeoutMs = effectiveTimeoutMs;
+        span.setAttribute('error.type', 'ai.timeout');
+        span.setStatus({ code: SpanStatusCode.ERROR, message: 'ai.timeout' });
+      }
+      recordMetric(effectiveModel, Date.now() - startMs, err.code || (err.status ? `http.${err.status}` : 'unknown'));
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      span.end();
+    }
+  });
+}
+
+/**
  * Convenience wrapper that returns parsed JSON object or { raw } on parse failure.
  */
 async function analyzeProblem(cfg, problem, options = {}) {
@@ -293,6 +438,7 @@ async function analyzeProblem(cfg, problem, options = {}) {
 
 module.exports = {
   chatCompletion,
+  streamChatCompletion,
   listModels,
   analyzeProblem,
   getMetrics,
