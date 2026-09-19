@@ -9,3 +9,10 @@ Thumbs.db
 server.log
 server.err
 debug.log
+watch.log
+watch.startup.log
+watch.startup2.log
+server.start.log
+server.test.log
+server.test.err
+smoke.log
