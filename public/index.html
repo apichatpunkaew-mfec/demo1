@@ -15,6 +15,7 @@
     <nav class="actions">
       <button id="btn-refresh" class="btn">Refresh</button>
       <button id="btn-analyze-all" class="btn primary" title="Analyze current problem list with AI">Analyze all (open)</button>
+      <button id="btn-open-tester" class="btn" title="API tester for all endpoints">🧪 Tester</button>
       <label class="model-picker">
         Model
         <select id="model-select"></select>
@@ -119,6 +120,98 @@
     </form>
   </aside>
 
+  <!-- API Tester panel (slide-out from right) -->
+  <aside class="tester-panel hidden" id="tester-panel" role="dialog" aria-label="API tester">
+    <header class="tester-header">
+      <div class="tester-title">
+        <span class="dot"></span>
+        <span>API Tester</span>
+        <span class="muted small">live request runner</span>
+      </div>
+      <div class="tester-actions">
+        <button class="btn small" id="tester-run-all" title="Run every endpoint once">▶ Run all</button>
+        <button class="btn small" id="tester-clear-history" title="Clear response history">Clear</button>
+        <button class="btn small" id="tester-close" aria-label="Close tester">&times;</button>
+      </div>
+    </header>
+
+    <div class="tester-body">
+      <!-- Endpoint picker -->
+      <div class="tester-row">
+        <label>Endpoint</label>
+        <select id="tester-endpoint" class="tester-input"></select>
+      </div>
+
+      <!-- Method + path preview -->
+      <div class="tester-row">
+        <label>Method / Path</label>
+        <div class="tester-method-row">
+          <span id="tester-method" class="badge method">GET</span>
+          <code id="tester-path-preview" class="tester-path">/api/health</code>
+          <span id="tester-rate-limit" class="muted small"></span>
+        </div>
+      </div>
+
+      <!-- Description (read-only) -->
+      <div class="tester-row">
+        <small id="tester-description" class="muted">Pick an endpoint above.</small>
+      </div>
+
+      <!-- Query parameters (for endpoints that take them) -->
+      <div class="tester-row" id="tester-query-row">
+        <label>
+          Query parameters
+          <button class="btn small" id="tester-add-query" type="button">+ add</button>
+        </label>
+        <div id="tester-query-list" class="tester-kv-list"></div>
+      </div>
+
+      <!-- Request body -->
+      <div class="tester-row" id="tester-body-row">
+        <label>
+          Request body (JSON)
+          <button class="btn small" id="tester-format-body" type="button" title="Pretty-print">format</button>
+          <button class="btn small" id="tester-reset-body" type="button" title="Reset to sample">reset</button>
+        </label>
+        <textarea id="tester-body" class="tester-textarea" rows="8" spellcheck="false"></textarea>
+        <small id="tester-body-status" class="muted"></small>
+      </div>
+
+      <!-- Path param hint -->
+      <div class="tester-row" id="tester-path-row">
+        <label>
+          Path parameters
+          <button class="btn small" id="tester-fill-from-row" type="button" title="Use selected problem id from the table">use selected row</button>
+        </label>
+        <div id="tester-path-list" class="tester-kv-list"></div>
+      </div>
+
+      <!-- Send -->
+      <div class="tester-row tester-send-row">
+        <button class="btn primary" id="tester-send">Send request</button>
+        <label class="tester-options">
+          <input type="checkbox" id="tester-stream" />
+          <span>Stream (SSE — when applicable)</span>
+        </label>
+      </div>
+
+      <!-- Last response -->
+      <div class="tester-row">
+        <label>Response</label>
+        <div id="tester-response" class="tester-response">
+          <div class="muted">Click <b>Send request</b> to run.</div>
+        </div>
+      </div>
+
+      <!-- History -->
+      <div class="tester-row">
+        <label>History <span class="muted small">(newest first)</span></label>
+        <div id="tester-history" class="tester-history"></div>
+      </div>
+    </div>
+  </aside>
+
+  <script src="/tester.js" type="module"></script>
   <script src="/app.js" type="module"></script>
 </body>
 </html>

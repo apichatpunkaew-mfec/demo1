@@ -48,6 +48,8 @@ const chatState = {
   streaming: false,
   attachedProblem: null,   // { problemId, title } | null
 };
+// Expose for the API Tester panel (loaded in a separate module).
+window.chatState = chatState;
 
 /* ------------------------------ helpers --------------------------- */
 async function api(method, path, body) {
